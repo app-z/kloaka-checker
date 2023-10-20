@@ -3,25 +3,27 @@ package com.example.kloakatester
 import android.bluetooth.BluetoothAdapter
 import android.content.Context
 import android.telephony.TelephonyManager
+import androidx.annotation.Keep
 import com.google.gson.annotations.SerializedName
-
 import io.ktor.client.*
 import io.ktor.client.call.body
 import io.ktor.client.engine.cio.*
+import io.ktor.client.plugins.BrowserUserAgent
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.get
 import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsText
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.launch
-
+import io.ktor.serialization.kotlinx.json.*
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.merge
+import kotlinx.coroutines.flow.toList
 import kotlinx.serialization.*
 import kotlinx.serialization.json.*
-import io.ktor.serialization.kotlinx.json.*
 
 
+@Keep
+@Serializable
 data class As(
 
     @SerializedName("asn") var asn: Int? = null,
@@ -32,6 +34,8 @@ data class As(
 
 )
 
+@Keep
+@Serializable
 data class Location(
 
     @SerializedName("country") var country: String? = null,
@@ -40,6 +44,8 @@ data class Location(
 
 )
 
+@Keep
+@Serializable
 data class ClientNetworkInfo(
 
     @SerializedName("ip") var ip: String? = null,
@@ -52,20 +58,28 @@ data class ClientNetworkInfo(
 
 
 object Checker {
-    suspend fun isOpenVebView(context: Context): Boolean {
-        return checkDeviceName("Pixel")
-                // || checkSim(context)
-                || checkDomens()
+    suspend fun isRejectVebWiew(context: Context): Flow<Boolean> {
+        return flow {
+            val result = merge(rejectByDeviceName("Pixel"), rejectByDomains())
+
+            val ret = result.toList().filter{ it.isFailure || it.getOrNull() == true}
+            if (ret.isNotEmpty()) emit(true)
+            else emit(false)
+        }
     }
 
 
-    fun checkDeviceName(MASK_NAME: String): Boolean {
-        val name = BluetoothAdapter.getDefaultAdapter().getName()
-        return name.contains(MASK_NAME, ignoreCase = true)
+    fun rejectByDeviceName(MASK_NAME: String): Flow<Result<Boolean>> {
+        return flow {
+            val adapter: BluetoothAdapter? = BluetoothAdapter.getDefaultAdapter()
+            if (adapter == null) emit(Result.success(true))
+            val name: String? = adapter?.getName()
+            emit(Result.success(name?.contains(MASK_NAME, ignoreCase = true) ?: true))
+        }
     }
 
 
-    fun checkSim(context: Context): Boolean {
+    fun rejectBySim(context: Context): Boolean {
         val tm = context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager?
         if (tm == null) return false
         val simID: String? = tm.simSerialNumber
@@ -74,56 +88,90 @@ object Checker {
         return true
     }
 
-    suspend fun checkDomens(): Boolean {
+    // false is ok
+    suspend fun rejectByDomains(): Flow<Result<Boolean>> {
+        val key = ""
 
-        val rejectedDomains = listOf<String>("Google", "goo")
+        val rejectedDomains = listOf("Google", "goo")
         val rejectRegion = "US"
 
-        CoroutineScope(Dispatchers.IO).launch {
+        return flow {
 
-            val res = async {
+            getRemoteIp().collect{
+                if(it.isSuccess && it.getOrNull() != null) {
+                    val ip = it.getOrNull()
+//                val ip = "8.8.8.8"
+                    val urlServAndReg =
+                        "https://geo.ipify.org/api/v2/country?apiKey=$key&ipAddress=$ip"
+                    println(urlServAndReg)
+                    try {
+                        val clientNetworkInfo: ClientNetworkInfo =
+                            Client.getClient().get(urlServAndReg).body()
 
-                val urlForIp = "https://api.ipify.org"
-                val client = HttpClient(CIO) {
-                    install(ContentNegotiation) {
-                        json(Json {
-                            prettyPrint = true
-                            isLenient = true
-                        })
+                        val intersectDomens = clientNetworkInfo.domains intersect rejectedDomains
+
+                        if (intersectDomens.isNotEmpty()) {
+                            emit(Result.success(true))
+                        } else if (clientNetworkInfo.location?.country.equals(
+                                    rejectRegion,
+                                    ignoreCase = true
+                                )
+                            ) {
+                                emit(Result.success(true))
+                            }
+                        else {
+                            emit(Result.success(false))
+                        }
+                    } catch (ex: Exception) {
+                        emit(Result.failure(ex))
                     }
+                } else {
+                    emit(Result.success(true))
                 }
-                val responseIp: HttpResponse = client.get(urlForIp)
-
-                if (!statusRequest(responseIp)) return@async false
-
-                var ip = responseIp.bodyAsText()
-                println("ip = $ip")
-//                ip = "8.8.8.8"
-
-                val urlServAndReg =
-                    "https://geo.ipify.org/api/v2/country?apiKey=$key&ipAddress=$ip"
-                val clientNetworkInfo: ClientNetworkInfo = client.get(urlServAndReg).body()
-
-                val intersectDomens = clientNetworkInfo.domains intersect rejectedDomains
-
-                if (intersectDomens.isNotEmpty())
-                    return@async false
-
-                if (clientNetworkInfo.location?.country.equals(rejectRegion, ignoreCase = true))
-                    return@async false
-
-                client.close()
-
-                return@async true
             }
-            res.await()
-
         }
-
-        return false
     }
 
-    fun statusRequest(response: HttpResponse): Boolean {
+    private suspend fun getRemoteIp(): Flow<Result<String>> {
+        val urlForIp = "https://api.ipify.org"
+        return flow {
+            try {
+                val responseIp: HttpResponse = Client.getClient().get(urlForIp)
+                val ip = responseIp.bodyAsText()
+                println("ip = $ip")
+                emit(Result.success(ip))
+            } catch (ex: Exception) {
+                emit(Result.failure(ex))
+            }
+        }
+    }
+
+
+    object Client {
+        private val client = HttpClient(CIO) {
+            BrowserUserAgent()
+//                    CurlUserAgent()
+            install(ContentNegotiation) {
+                engine {
+                    requestTimeout = 10_000
+                }
+                json(Json {
+                    prettyPrint = true
+                    ignoreUnknownKeys = true
+                })
+            }
+        }
+
+        fun getClient(): HttpClient {
+            return client
+        }
+
+        fun close() {
+            client.close()
+        }
+    }
+
+    private fun statusRequest(response: HttpResponse): Boolean {
         return (response.status.value in 200..299)
     }
 
